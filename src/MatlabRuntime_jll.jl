@@ -55,12 +55,29 @@ end
 """
     download_url(; release = _release(), update = _update()) -> String
 
-Direct download URL of the MATLAB Runtime installer zip from MathWorks.
-`update = "0"` selects the base release; `"1"`, `"2"`, ... select update releases.
+Direct download URL of the MATLAB Runtime installer from MathWorks.
+
+Two URL schemes exist, selected automatically by release:
+
+- R2019a and newer: the current zipped installer,
+  `.../<release>/Release/<update>/deployment_files/installer/complete/<platform>/MATLAB_Runtime_<release>_<platform>.zip`;
+  `update = "0"` selects the base release, `"1"`, `"2"`, ... the update releases.
+- R2013b .. R2018a: the legacy "MCR" installer scheme,
+  `.../<release>/deployment_files/<release>/installers/<platform>/MCR_<release>_<platform>_installer.zip`
+  (a `.exe` on Windows). Update installers do not exist for these releases,
+  so `update` must be `"0"`.
 """
 function download_url(; release = _release(), update = _update())
     platform = _platform()
     upd = string(update)
+    if _release_index(string(release)) < _MODERN_INSTALLER_MIN
+        upd == "0" || isempty(upd) ||
+            error("Update installers do not exist for releases before R2019a; " *
+                  "requested $(release) update $(upd).")
+        ext = Sys.iswindows() ? "exe" : "zip"
+        fname = "MCR_$(release)_$(platform)_installer.$(ext)"
+        return "https://ssd.mathworks.com/supportfiles/downloads/$(release)/deployment_files/$(release)/installers/$(platform)/$(fname)"
+    end
     fname = upd == "0" ?
         "MATLAB_Runtime_$(release)_$(platform).zip" :
         "MATLAB_Runtime_$(release)_Update_$(upd)_$(platform).zip"
@@ -417,9 +434,17 @@ function _extract(zip, dest)
     end
 end
 
-"""Locate the installer executable inside the extracted installer zip."""
+"""Locate the installer entry point inside the extracted installer zip/dir."""
 function _find_installer(dir)
-    Sys.iswindows() || return joinpath(dir, "install")
+    if !Sys.iswindows()
+        cand = joinpath(dir, "install")
+        isfile(cand) && return cand
+        # legacy zips may nest one directory level deep
+        for (root, dirs, files) in walkdir(dir)
+            "install" in files && return joinpath(root, "install")
+        end
+        error("No installer entry point found in $(dir)")
+    end
     for (root, dirs, files) in walkdir(dir)
         for f in files
             endswith(lowercase(f), ".exe") && return joinpath(root, f)
@@ -444,11 +469,11 @@ function _extraction_complete(dir)
         return false
     end
     Sys.iswindows() && return true
-    archbin = joinpath(dir, "bin", _platform())
+    archbin = joinpath(dirname(_find_installer(dir)), "bin", _platform())
     isdir(archbin) || return false
     return any(isfile(joinpath(archbin, f)) for f in
                ("MathWorksProductInstaller", "MATLABRuntimeInstaller",
-                "install_unix", "install_unix_legacy"))
+                "install_unix", "install_unix_legacy", "MCRInstaller"))
 end
 
 """Whether the current process has administrator privileges (Windows only)."""
@@ -505,22 +530,31 @@ function _release_index(release)
     return parse(Int, m.captures[1]) * 2 + (m.captures[2] == "b")
 end
 
-# MathWorks distribution boundaries, determined empirically: the installer
-# download URLs serve R2019a and newer, the container registry has images
-# from R2021b onward. Older releases are gone; a matching runtime tree must
-# come from an existing installation (find_system_runtime / env override).
-const _INSTALLER_MIN = _release_index("R2019a")
+# MathWorks distribution boundaries, determined empirically:
+# - the current installer download URLs serve R2019a and newer
+# - the legacy MCR installer URLs serve R2013b .. R2018a
+# - the container registry has images from R2021b onward
+# Older releases are gone; a matching runtime tree must come from an
+# existing installation (find_system_runtime / env override).
+const _MODERN_INSTALLER_MIN = _release_index("R2019a")
+const _LEGACY_INSTALLER_MIN = _release_index("R2013b")
 const _CONTAINER_MIN = _release_index("R2021b")
 
 """Error thrown when MathWorks no longer distributes the requested release."""
 function _undistributed_error(release)
+    vd = try
+        version_dir(release)
+    catch
+        ""  # releases before R2013a have no version mapping either
+    end
+    target = isempty(vd) ? "the release's v<ver> folder" : vd
     return ErrorException(
         "MATLAB Runtime $(release) is not distributed by MathWorks anymore: " *
-        "installer downloads are available from R2019a onward and container images " *
+        "installer downloads are available from R2013b onward and container images " *
         "from R2021b onward, and MATLAB-compiled binaries require the exact runtime " *
         "version they were built with. Point the package at an existing installation " *
         "instead: set $(ENV_ROOT) (or MCR_ROOT) to a runtime root containing " *
-        "$(version_dir(release)), or use find_system_runtime(; release = \"$(release)\") " *
+        "$(target), or use find_system_runtime(; release = \"$(release)\") " *
         "to locate a system-wide installation.")
 end
 
@@ -550,9 +584,10 @@ manifest requires administrator privileges; if Julia is not running elevated
 a single UAC consent prompt is shown.
 
 Releases that MathWorks no longer distributes (installer downloads start at
-R2019a, container images at R2021b) fail immediately with an error explaining
+R2013b, container images at R2021b) fail immediately with an error explaining
 how to use an existing runtime tree via `MATLABRUNTIME_JLL_ROOT` or
-`find_system_runtime`.
+`find_system_runtime`. For R2013b .. R2018a the installer backend downloads
+the legacy MCR installer; update installers do not exist for those releases.
 
 Installing takes several GB of disk space and several minutes.
 """
@@ -571,7 +606,7 @@ function install(; release = _release(), update = _update(), force = false,
     b = lowercase(string(backend))
     idx = _release_index(release)
     container_possible = !Sys.iswindows() && idx >= _CONTAINER_MIN
-    installer_possible = idx >= _INSTALLER_MIN
+    installer_possible = idx >= _LEGACY_INSTALLER_MIN
 
     if !container_possible && !installer_possible
         throw(_undistributed_error(release))
@@ -607,34 +642,38 @@ function _install_from_installer(release, upd; force = false, keep_installer = f
     dest = _runtime_dir(release, upd)
 
     url = download_url(; release, update = upd)
-    @info "Downloading MATLAB Runtime $(release) (update $(upd), $(platform))" *
-          " from MathWorks. This is a multi-GB download and may take a long time." url
+    @info "Downloading MATLAB Runtime installer for $(release) (update $(upd), $(platform))" url
 
     idir = _installer_dir()
     mkpath(idir)
-    zip = joinpath(idir, "MATLAB_Runtime_$(release)_$(upd)_$(platform).zip")
-    _ensure_downloaded(url, zip)
-
-    exdir = joinpath(idir, "extracted_$(release)_$(upd)_$(platform)")
-    if !force && _extraction_complete(exdir)
-        @info "Reusing previously extracted installer" exdir
-    else
-        rm(exdir; recursive = true, force = true)
-        @info "Extracting installer archive"
-        _extract(zip, exdir)
-    end
-    if !Sys.iswindows()
-        # The installer zip does not preserve executable bits; the installer
-        # dies with exit code 42 when its helper binaries (e.g. silentlauncher)
-        # cannot be executed. Mark all extracted files as executable.
-        find = Sys.which("find")
-        find === nothing || run(`$find $exdir -type f -exec chmod a+x "{}" +`)
-    end
-
-    installer = _find_installer(exdir)
-    chmod(installer, 0o755)
+    archive = joinpath(idir, basename(url))
+    _ensure_downloaded(url, archive)
 
     mkpath(dirname(dest))
+    installer = if Sys.iswindows() && endswith(lowercase(basename(url)), ".exe")
+        # Legacy MCR installer (R2018a and earlier): a self-extracting exe
+        # that IS the installer; run it directly, no extraction step.
+        archive
+    else
+        exdir = joinpath(idir, "extracted_$(release)_$(upd)_$(platform)")
+        if !force && _extraction_complete(exdir)
+            @info "Reusing previously extracted installer" exdir
+        else
+            rm(exdir; recursive = true, force = true)
+            @info "Extracting installer archive"
+            _extract(archive, exdir)
+        end
+        if !Sys.iswindows()
+            # The installer zip does not preserve executable bits; the installer
+            # dies with exit code 42 when its helper binaries (e.g. silentlauncher)
+            # cannot be executed. Mark all extracted files as executable.
+            find = Sys.which("find")
+            find === nothing || run(`$find $exdir -type f -exec chmod a+x "{}" +`)
+        end
+        _find_installer(exdir)
+    end
+    chmod(installer, 0o755)
+
     @info "Running MATLAB Runtime installer silently; this can take several minutes" dest
     _run_installer(installer, dest)
 
@@ -649,7 +688,8 @@ function _install_from_installer(release, upd; force = false, keep_installer = f
     _write_marker(dest, release, upd)
 
     if !keep_installer
-        rm(zip; force = true)
+        rm(archive; force = true)
+        exdir = joinpath(idir, "extracted_$(release)_$(upd)_$(platform)")
         rm(exdir; recursive = true, force = true)
     end
     @info "MATLAB Runtime $(release) (update $(upd)) installed at $(dest)"

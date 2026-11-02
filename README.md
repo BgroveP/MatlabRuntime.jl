@@ -68,11 +68,18 @@ accordingly).
 
 **Old releases (important for pre-2019 binaries).** Deployed binaries only
 run against the exact runtime version they were compiled with. MathWorks
-currently serves installer downloads only for R2019a and newer, and the
-container registry only has R2021b and newer. `install()` fails immediately
-with a clear error for undistributed releases, so for older applications
-(e.g. anything needing the R2017a / v9.2 runtime) point the package at an
-existing installation:
+serves runtimes through three channels, and the package picks the right one
+automatically:
+
+- container images: R2021b and newer (default backend on Linux),
+- current installer downloads: R2019a and newer,
+- legacy MCR installer downloads: R2013b .. R2018a
+  (`.../deployment_files/<rel>/installers/<platform>/MCR_<rel>_<platform>_installer.zip`,
+  a `.exe` on Windows). Update installers do not exist for these releases,
+  so `update` must be `"0"`.
+
+Releases before R2013b are no longer distributed at all; for those, point the
+package at an existing installation:
 
 - `find_system_runtime(release = "R2017a")` checks the default system
   locations (`/usr/local/MATLAB/MATLAB_Runtime`, `/opt/...`) and the

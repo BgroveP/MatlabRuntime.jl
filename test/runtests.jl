@@ -10,7 +10,7 @@ const MCR = MatlabRuntime_jll
     end
 
     @testset "download_url" begin
-        # default release/update
+        # default release/update (modern scheme)
         url = MCR.download_url()
         if Sys.iswindows()
             @test url == "https://ssd.mathworks.com/supportfiles/downloads/$(MCR.DEFAULT_RELEASE)/Release/0/deployment_files/installer/complete/win64/MATLAB_Runtime_$(MCR.DEFAULT_RELEASE)_win64.zip"
@@ -21,11 +21,22 @@ const MCR = MatlabRuntime_jll
         url1 = MCR.download_url(; release = "R2020a", update = "5")
         @test occursin("/R2020a/Release/5/deployment_files/installer/complete/", url1)
         @test endswith(url1, "MATLAB_Runtime_R2020a_Update_5_" * MCR._platform() * ".zip")
+        # legacy MCR scheme for R2013b..R2018a, base release only
+        url2 = MCR.download_url(; release = "R2017a")
+        if Sys.iswindows()
+            @test url2 == "https://ssd.mathworks.com/supportfiles/downloads/R2017a/deployment_files/R2017a/installers/win64/MCR_R2017a_win64_installer.exe"
+        else
+            @test url2 == "https://ssd.mathworks.com/supportfiles/downloads/R2017a/deployment_files/R2017a/installers/glnxa64/MCR_R2017a_glnxa64_installer.zip"
+        end
+        @test_throws ErrorException MCR.download_url(; release = "R2017a", update = "2")
     end
 
     @testset "download URL is reachable" begin
         resp = Downloads.request(MCR.download_url())
         @test resp.status == 200
+        # legacy MCR installer for R2017a is still served by MathWorks
+        resp2 = Downloads.request(MCR.download_url(; release = "R2017a"); method = "HEAD")
+        @test resp2.status == 200
     end
 
     @testset "version/env helpers against a fake runtime root" begin
@@ -135,16 +146,25 @@ const MCR = MatlabRuntime_jll
     end
 
     @testset "release availability guard" begin
-        # R2017a is not distributed by MathWorks anymore: fail fast, no network
+        # R2012a is not distributed by MathWorks anymore: fail fast, no network
         err = try
-            MCR.install(; release = "R2017a")
+            MCR.install(; release = "R2012a")
             nothing
         catch e
             e
         end
         @test err isa ErrorException
         @test occursin("not distributed", err.msg)
-        @test occursin(MCR.version_dir("R2017a"), err.msg)  # mentions v92
+        # R2017a is downloadable via the legacy MCR scheme, so it must NOT be
+        # blocked; asking for an update on it is the error case
+        err1 = try
+            MCR.install(; release = "R2017a", update = "2")
+            nothing
+        catch e
+            e
+        end
+        @test err1 isa ErrorException
+        @test occursin("Update installers do not exist", err1.msg)
         # explicit container backend for a pre-R2021b release also fails fast
         if Sys.islinux()
             err2 = try
