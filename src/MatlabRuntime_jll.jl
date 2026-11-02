@@ -7,7 +7,8 @@ using Scratch
 
 export install, uninstall, is_installed, installed_releases,
     mcr_root, mcr_version, runtime_lib_dir, mcr_env, with_runtime,
-    download_url, container_tag, release_version
+    download_url, container_tag, release_version, version_dir,
+    find_system_runtime
 
 const DEFAULT_RELEASE = "R2026b"
 const DEFAULT_UPDATE = "0"
@@ -90,16 +91,48 @@ const _MANIFEST_ACCEPT = "application/vnd.oci.image.index.v1+json, " *
 """
     release_version(release = _release()) -> String
 
-MATLAB runtime version string for a release name, e.g. `"R2026b"` -> `"26.2"`.
-This is the `v<version>` folder name used by runtime installations.
+MATLAB Runtime version string for a release name, using MATLAB's historical
+version numbering:
+
+- `R2023b` and newer: year-based, e.g. `"R2026b"` -> `"26.2"`
+- `R2016a` .. `R2023a`: `9.x`, e.g. `"R2017a"` -> `"9.2"`, `"R2021a"` -> `"9.10"`
+- `R2013a` .. `R2015b`: `8.x`, e.g. `"R2013b"` -> `"8.2"`
+
+Note that a deployed binary only runs against the exact runtime version it
+was compiled with, so this mapping matters when serving old applications.
 """
 function release_version(release = _release())
     m = match(r"^R(\d{4})([ab])$", string(release))
     m === nothing && error("Invalid MATLAB release name \"$(release)\" " *
                            "(expected e.g. \"R2026b\")")
-    minor = m.captures[2] == "a" ? "1" : "2"
-    return string(parse(Int, m.captures[1]) % 100, ".", minor)
+    year = parse(Int, m.captures[1])
+    half = m.captures[2] == "a" ? 0 : 1
+    if year > 2023 || (year == 2023 && half == 1)
+        # year-based scheme, introduced with R2023b (23.2)
+        return string(year % 100, ".", half == 0 ? 1 : 2)
+    elseif year >= 2016
+        # 9.x scheme: R2016a = 9.0 ... R2023a = 9.14
+        return string("9.", (year - 2016) * 2 + half)
+    elseif year >= 2013
+        # 8.x scheme: R2013a = 8.1 ... R2015b = 8.6
+        return string("8.", (year - 2013) * 2 + half + 1)
+    end
+    error("MATLAB releases before R2013a are not supported.")
 end
+
+"""
+    version_dir(release = _release()) -> String
+
+Name of the `v<version>` directory of a runtime installation for `release`,
+matching what the MathWorks installer creates: the version string without
+the dot, e.g. `"R2017a"` -> `"v92"`, `"R2021a"` -> `"v910"`,
+`"R2026b"` -> `"v262"`.
+"""
+version_dir(release = _release()) = "v" * replace(release_version(release), "." => "")
+
+"""Folder names a runtime tree could use for `release` (dotless and dotted)."""
+_version_dir_candidates(release) =
+    unique([version_dir(release), "v" * release_version(release)])
 
 """
     container_tag(; release = _release(), update = _update(), variant = "") -> String
@@ -246,8 +279,8 @@ function _install_from_container(release, upd; variant = "", force = false,
 
     rt = joinpath(rootfs, "opt", "matlabruntime")
     isdir(rt) || error("Container image $(tag) has no /opt/matlabruntime directory.")
-    ver = release_version(release)
-    if !isdir(joinpath(rt, "v$ver"))
+    vname = version_dir(release)  # e.g. v92, v262: the installer's convention
+    if !isdir(joinpath(rt, vname))
         found = nothing
         for d in readdir(rt)
             isdir(joinpath(rt, d)) || continue
@@ -257,7 +290,7 @@ function _install_from_container(release, upd; variant = "", force = false,
             end
         end
         found === nothing && error("No runtime found in container image under $(rt).")
-        mv(joinpath(rt, found), joinpath(rt, "v$ver"))
+        mv(joinpath(rt, found), joinpath(rt, vname))
     end
 
     # Same scratch filesystem: this is a cheap rename.
@@ -593,13 +626,19 @@ function uninstall(; release = _release(), update = _update())
 end
 
 """
-    find_system_runtime() -> Union{String, Nothing}
+    find_system_runtime(; release = nothing) -> Union{String, Nothing}
 
 Look for an existing system-wide MATLAB Runtime installation in the usual
 default locations. Returns the root directory (containing `v<ver>` folders),
 or `nothing` if none is found.
+
+When `release` is given (e.g. `"R2017a"`), only a root that actually contains
+that release's runtime version directory (e.g. `v92`, matching both the
+dotted and dotless naming conventions) is accepted. This is how to locate an
+old runtime that MathWorks no longer distributes (R2018a and earlier are not
+downloadable and have no container image).
 """
-function find_system_runtime()
+function find_system_runtime(; release = nothing)
     hint = get(ENV, ENV_ROOT, "")
     hint = isempty(hint) ? get(ENV, "MCR_ROOT", "") : hint
     candidates = String[]
@@ -613,8 +652,12 @@ function find_system_runtime()
                           "/opt/MATLAB_Runtime")
     end
     for c in candidates
-        if isdir(c) && !isempty(_version_dirs(c))
-            return c
+        isdir(c) || continue
+        if release === nothing
+            isempty(_version_dirs(c)) || return c
+        else
+            any(isdir(joinpath(c, d)) for d in _version_dir_candidates(string(release))) &&
+                return c
         end
     end
     return nothing
@@ -645,13 +688,12 @@ function mcr_root(; release = _release(), update = _update(), autoinstall = _aut
     if autoinstall
         return install(; release, update)
     end
-    sys = find_system_runtime()
+    sys = find_system_runtime(; release)
     sys === nothing && error(
         "MATLAB Runtime is not installed. Run `using MatlabRuntime_jll; MatlabRuntime_jll.install()` " *
         "or set $(ENV_ROOT) to an existing runtime root, or unset " *
         "MATLABRUNTIME_JLL_NO_AUTO_INSTALL to allow automatic installation.")
-    @warn "No package-managed MATLAB Runtime found; using system installation. " *
-          "Its version may not match the requested release $(release)." sys
+    @warn "No package-managed MATLAB Runtime found; using system installation." sys
     return sys
 end
 
@@ -659,13 +701,35 @@ end
     mcr_version(root = mcr_root()) -> String
 
 Runtime version string of the (single) installed runtime under `root`,
-e.g. `"26.2"` for R2026b. This corresponds to the `v<ver>` folder name.
+e.g. `"26.2"` for R2026b or `"9.2"` for R2017a. For package-managed
+installs the version is derived from the recorded release; otherwise it
+is taken from the `v<ver>` folder name as-is (dotless for old runtimes,
+e.g. `"92"` for a `v92` tree).
 """
 function mcr_version(root = mcr_root())
+    marker = joinpath(root, MARKER)
+    if isfile(marker)
+        try
+            return release_version(_marker_field(root, "release"))
+        catch
+        end
+    end
     dirs = _version_dirs(root)
     isempty(dirs) && error("No v<version> runtime directory found under $(root)")
     length(dirs) == 1 || @warn "Multiple runtime versions under $(root); using the first" dirs
     return replace(basename(first(dirs)), "v" => "")
+end
+
+"""
+The `v<ver>` directory of the runtime installed under `root`. Uses the
+directory that actually exists, so both dotless (`v92`) and dotted
+(`v26.2`) conventions work, including for system-wide installations.
+"""
+function _version_dir_of(root)
+    dirs = _version_dirs(root)
+    isempty(dirs) && error("No v<version> runtime directory found under $(root)")
+    length(dirs) == 1 || @warn "Multiple runtime versions under $(root); using the first" dirs
+    return first(dirs)
 end
 
 """
@@ -675,7 +739,7 @@ Directory that contains the MATLAB Runtime shared libraries
 (`<root>/v<ver>/runtime/<arch>`), for users who need the raw DLL/SO path.
 """
 function runtime_lib_dir(root = mcr_root())
-    return joinpath(root, "v" * mcr_version(root), "runtime", _platform())
+    return joinpath(_version_dir_of(root), "runtime", _platform())
 end
 
 """
@@ -691,7 +755,7 @@ Compiler against the runtime at `root`:
 Use [`with_runtime`](@ref) to apply these to a command.
 """
 function mcr_env(root = mcr_root())
-    verdir = joinpath(root, "v" * mcr_version(root))
+    verdir = _version_dir_of(root)
     arch = _platform()
     subdirs = Sys.iswindows() ? ("runtime", "bin", "sys/os") :
               ("runtime", "bin", "sys/os", "sys/opengl/lib", "extern/bin")

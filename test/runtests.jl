@@ -63,9 +63,38 @@ const MCR = MatlabRuntime_jll
     @testset "release/version mapping" begin
         @test MCR.release_version("R2026b") == "26.2"
         @test MCR.release_version("R2025a") == "25.1"
-        @test MCR.release_version("R2020a") == "20.1"
+        @test MCR.release_version("R2020a") == "9.8"
+        @test MCR.release_version("R2023b") == "23.2"
+        @test MCR.release_version("R2023a") == "9.14"
+        @test MCR.release_version("R2021a") == "9.10"
+        @test MCR.release_version("R2017a") == "9.2"   # MeSCoT's "v92"
+        @test MCR.release_version("R2013b") == "8.2"
         @test_throws ErrorException MCR.release_version("2026b")
         @test_throws ErrorException MCR.release_version("R2026c")
+        @test_throws ErrorException MCR.release_version("R2012b")
+    end
+
+    @testset "version_dir" begin
+        @test MCR.version_dir("R2026b") == "v262"
+        @test MCR.version_dir("R2021a") == "v910"
+        @test MCR.version_dir("R2017a") == "v92"
+        @test MCR.version_dir() == "v262"
+    end
+
+    @testset "helpers against a v92-style system tree" begin
+        # Old runtimes (e.g. R2017a for MeSCoT) install as v92 with no marker;
+        # the env plumbing must work against such trees.
+        mktempdir() do root
+            vdir = joinpath(root, "v92", "runtime", MCR._platform())
+            bin = joinpath(root, "v92", "bin", MCR._platform())
+            mkpath(vdir)
+            mkpath(bin)
+            @test MCR.runtime_lib_dir(root) == vdir
+            env = MCR.mcr_env(root)
+            key = Sys.iswindows() ? "PATH" : "LD_LIBRARY_PATH"
+            @test occursin(vdir, env[key])
+            @test MCR.mcr_version(root) == "92"  # raw folder name without marker
+        end
     end
 
     @testset "container_tag" begin
@@ -113,6 +142,16 @@ const MCR = MatlabRuntime_jll
         # Not installed anywhere in this test environment
         withenv("MATLABRUNTIME_JLL_ROOT" => nothing, "MCR_ROOT" => nothing) do
             @test MCR.find_system_runtime() === nothing
+            @test MCR.find_system_runtime(; release = "R2017a") === nothing
+        end
+        # Release-filtered detection through MCR_ROOT
+        mktempdir() do root
+            mkpath(joinpath(root, "v92", "runtime", MCR._platform()))
+            withenv("MATLABRUNTIME_JLL_ROOT" => nothing, "MCR_ROOT" => root) do
+                @test MCR.find_system_runtime() == root
+                @test MCR.find_system_runtime(; release = "R2017a") == root
+                @test MCR.find_system_runtime(; release = "R2026b") === nothing
+            end
         end
     end
 

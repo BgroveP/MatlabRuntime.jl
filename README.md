@@ -66,6 +66,21 @@ or users can set the environment variables `MATLABRUNTIME_JLL_RELEASE` /
 ... select update releases (the installer URL and container image tag change
 accordingly).
 
+**Old releases (important for pre-2019 binaries).** Deployed binaries only
+run against the exact runtime version they were compiled with. MathWorks
+currently serves installer downloads only for R2019a and newer, and the
+container registry only has R2021b and newer — so for older applications
+(e.g. anything needing the R2017a / v9.2 runtime), `install()` cannot fetch
+the runtime. In that case point the package at an existing installation:
+
+- `find_system_runtime(release = "R2017a")` checks the default system
+  locations (`/usr/local/MATLAB/MATLAB_Runtime`, `/opt/...`) and the
+  `MATLABRUNTIME_JLL_ROOT` / `MCR_ROOT` hints for a tree containing `v92`;
+- `mcr_env` / `with_runtime` work against any runtime root, including
+  such system trees, so downstream wrappers keep using them for plumbing;
+- `version_dir` / `release_version` give the release-to-`v<ver>` mapping
+  (R2017a -> `v92`, R2021a -> `v910`, R2026b -> `v262`).
+
 ### Environment variables
 
 | Variable | Effect |
@@ -94,13 +109,14 @@ versions can coexist. `MatlabRuntime_jll.uninstall()` removes one.
 | `installed_releases()` | List installed `(release, update)` pairs. |
 | `download_url(; release, update)` | Direct MathWorks download URL for the installer zip (installer backend). |
 | `container_tag(; release, update, variant)` | Tag of the official MATLAB Runtime container image (container backend). |
-| `release_version([release])` | Runtime version string for a release, e.g. `"R2026b"` -> `"26.2"`. |
+| `release_version([release])` | Runtime version string for a release, e.g. `"R2017a"` -> `"9.2"`, `"R2026b"` -> `"26.2"`. |
+| `version_dir([release])` | Installed `v<ver>` folder name, e.g. `"R2017a"` -> `"v92"`. |
 | `mcr_root()` | Installation root (contains `v<ver>`). Pass to `run_*.sh`/`run_*.bat` launchers. |
 | `mcr_version([root])` | Runtime version string, e.g. `"26.2"`. |
 | `runtime_lib_dir([root])` | Directory with the runtime shared libraries. |
 | `mcr_env([root])` | `Dict` of env vars (`PATH` / `LD_LIBRARY_PATH`) needed by compiled binaries. |
 | `with_runtime(cmd; root)` | A `Cmd` with those env vars applied, ready for `run`. |
-| `find_system_runtime()` | Look for a system-wide MATLAB Runtime in default locations. |
+| `find_system_runtime(; release)` | Look for a system-wide MATLAB Runtime; with `release`, only accept a tree containing that release's `v<ver>`. |
 
 ## License note
 
