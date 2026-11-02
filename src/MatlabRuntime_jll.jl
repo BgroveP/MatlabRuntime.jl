@@ -1,11 +1,13 @@
 module MatlabRuntime_jll
 
 using Downloads
+using JSON
 using Preferences
 using Scratch
 
 export install, uninstall, is_installed, installed_releases,
-    mcr_root, mcr_version, runtime_lib_dir, mcr_env, with_runtime, download_url
+    mcr_root, mcr_version, runtime_lib_dir, mcr_env, with_runtime,
+    download_url, container_tag, release_version
 
 const DEFAULT_RELEASE = "R2026b"
 const DEFAULT_UPDATE = "0"
@@ -68,6 +70,206 @@ _scratch() = @get_scratch!("matlabruntime")
 _installer_dir() = joinpath(_scratch(), "installer")
 _runtime_dir(release, update) = joinpath(_scratch(), "runtime", "$(release)_$(string(update))")
 
+#------------------------- Container backend ------------------------
+# The official MATLAB Runtime container image
+# (containers.mathworks.com/matlab-runtime:<tag>) contains a fully
+# installed runtime under /opt/matlabruntime. Pulling the image layers
+# directly over the OCI registry HTTP API and unpacking them requires no
+# Docker/Singularity, no admin rights, and never runs the (fragile)
+# MathWorks installer.
+
+const _REGISTRY = "containers.mathworks.com"
+const _REPO = "matlab-runtime"
+const _AUTH_REALM = "https://containers-auth.mathworks.com/auth"
+const _AUTH_SERVICE = "mathworksdockerregistry"
+const _MANIFEST_ACCEPT = "application/vnd.oci.image.index.v1+json, " *
+    "application/vnd.oci.image.manifest.v1+json, " *
+    "application/vnd.docker.distribution.manifest.list.v2+json, " *
+    "application/vnd.docker.distribution.manifest.v2+json"
+
+"""
+    release_version(release = _release()) -> String
+
+MATLAB runtime version string for a release name, e.g. `"R2026b"` -> `"26.2"`.
+This is the `v<version>` folder name used by runtime installations.
+"""
+function release_version(release = _release())
+    m = match(r"^R(\d{4})([ab])$", string(release))
+    m === nothing && error("Invalid MATLAB release name \"$(release)\" " *
+                           "(expected e.g. \"R2026b\")")
+    minor = m.captures[2] == "a" ? "1" : "2"
+    return string(parse(Int, m.captures[1]) % 100, ".", minor)
+end
+
+"""
+    container_tag(; release = _release(), update = _update(), variant = "") -> String
+
+Tag of the official MATLAB Runtime container image on
+`containers.mathworks.com` for `(release, update)`, e.g. `("R2026b", "2")`
+-> `"r2026b-update-2"`. `variant = "full"` selects the image that includes
+the GPU libraries.
+"""
+function container_tag(; release = _release(), update = _update(), variant = "")
+    tag = "r" * lowercase(string(release)[2:end])
+    upd = string(update)
+    tag = isempty(upd) || upd == "0" ? tag : tag * "-update-" * upd
+    v = string(variant)
+    return isempty(v) ? tag : tag * "-" * v
+end
+
+_container_arch() =
+    Sys.ARCH === :x86_64 ? "amd64" :
+    error("The MATLAB Runtime container image supports only x86_64 Linux.")
+
+"""Anonymous pull token for the MathWorks container registry."""
+function _container_token()
+    url = "$(_AUTH_REALM)?service=$(_AUTH_SERVICE)&scope=repository:$(_REPO):pull"
+    body = String(take!(Downloads.download(url, IOBuffer())))
+    m = match(r"\"token\"\s*:\s*\"([^\"]+)\"", body)
+    m === nothing && error("Could not obtain a container registry token: $(body)")
+    return m.captures[1]
+end
+
+function _fetch_json(url, headers)
+    return JSON.parse(String(take!(Downloads.download(url, IOBuffer(); headers))))
+end
+
+"""Image manifest for `tag`; resolves multi-arch indexes to the amd64 image."""
+function _container_manifest(tag, token)
+    url = "https://$(_REGISTRY)/v2/$(_REPO)/manifests/$(tag)"
+    headers = ["Accept" => _MANIFEST_ACCEPT, "Authorization" => "Bearer $(token)"]
+    manifest = _fetch_json(url, headers)
+    if haskey(manifest, "manifests")
+        arch = _container_arch()
+        refs = [e for e in manifest["manifests"]
+                if get(get(e, "platform", Dict()), "architecture", "") == arch]
+        isempty(refs) && error("Container image $(tag) has no $(arch) build.")
+        digest = refs[1]["digest"]
+        manifest = _fetch_json("https://$(_REGISTRY)/v2/$(_REPO)/manifests/$(digest)", headers)
+    end
+    return manifest
+end
+
+function _download_blob(digest, dest; token)
+    url = "https://$(_REGISTRY)/v2/$(_REPO)/blobs/$(digest)"
+    Downloads.download(url, dest; headers = ["Authorization" => "Bearer $(token)"])
+    return dest
+end
+
+"""
+    _extract_container_layer(tgz, dest)
+
+Extract one OCI image layer (a gzipped tar) into `dest`, then apply overlay
+whiteouts (`.wh.*` entries deleting files from lower layers).
+"""
+function _extract_container_layer(tgz, dest)
+    tar = something(Sys.which("tar"), Sys.which("bsdtar"))
+    tar === nothing && error("Extracting container layers requires `tar` on PATH.")
+    run(`$tar -xzf $(tgz) -C $(dest)`)
+    # Collect whiteout entries first, then apply them: modifying the tree
+    # while walkdir iterates it causes ENOENT errors.
+    whiteouts = String[]
+    try
+        for (root, dirs, files) in walkdir(dest)
+            for f in files
+                startswith(f, ".wh.") && push!(whiteouts, joinpath(root, f))
+            end
+        end
+    catch err
+        # A dangling symlinked directory can make walkdir fail; whiteouts
+        # are an edge case, so continue with what was collected.
+        err isa IOError || rethrow()
+    end
+    for wh in whiteouts
+        dir = dirname(wh)
+        f = basename(wh)
+        if f == ".wh..wh..opq"
+            for e in readdir(dir)
+                e == f && continue
+                rm(joinpath(dir, e); recursive = true, force = true)
+            end
+        else
+            rm(joinpath(dir, f[5:end]); recursive = true, force = true)
+        end
+        rm(wh; force = true)
+    end
+    return dest
+end
+
+"""
+    _install_from_container(release, upd; variant, force, keep_installer) -> String
+
+Install the MATLAB Runtime by pulling the official MathWorks container image
+for `(release, upd)` and unpacking the already-installed runtime tree into the
+package scratch space. No installer is executed and no admin rights are
+required. Returns the runtime root (the directory containing `v<ver>`).
+"""
+function _install_from_container(release, upd; variant = "", force = false,
+                                 keep_installer = false)
+    tag = container_tag(; release, update = upd, variant)
+    dest = _runtime_dir(release, upd)
+    mkpath(dirname(dest))
+
+    @info "Installing MATLAB Runtime $(release) (update $(upd)) from the MathWorks " *
+          "container image (no installer is run)" tag dest
+    token = _container_token()
+    manifest = _container_manifest(tag, token)
+    layers = get(manifest, "layers", nothing)
+    (layers === nothing || isempty(layers)) &&
+        error("Container manifest for $(tag) has no layers.")
+
+    idir = joinpath(_installer_dir(), "container_$(tag)")
+    mkpath(idir)
+    rootfs = joinpath(idir, "rootfs")
+    rm(rootfs; recursive = true, force = true)
+    mkpath(rootfs)
+
+    nonempty = [l for l in layers if l["size"] > 0]
+    for (i, layer) in enumerate(nonempty)
+        digest = layer["digest"]
+        lname = "layer_$(i)_$(split(digest, ":")[end][1:12]).tgz"
+        lpath = joinpath(idir, lname)
+        if isfile(lpath) && filesize(lpath) == layer["size"]
+            @info "Reusing previously downloaded container layer" lpath
+        else
+            @info "Downloading container layer $(i)/$(length(nonempty))" size_MB = layer["size"] ÷ 1048576
+            try
+                _download_blob(digest, lpath; token)
+            catch
+                # the anonymous token may have expired mid-download; retry once
+                _download_blob(digest, lpath; token = _container_token())
+            end
+        end
+        @info "Extracting container layer $(i)/$(length(nonempty))"
+        _extract_container_layer(lpath, rootfs)
+    end
+
+    rt = joinpath(rootfs, "opt", "matlabruntime")
+    isdir(rt) || error("Container image $(tag) has no /opt/matlabruntime directory.")
+    ver = release_version(release)
+    if !isdir(joinpath(rt, "v$ver"))
+        found = nothing
+        for d in readdir(rt)
+            isdir(joinpath(rt, d)) || continue
+            if isdir(joinpath(rt, d, "runtime", _platform()))
+                found = d
+                break
+            end
+        end
+        found === nothing && error("No runtime found in container image under $(rt).")
+        mv(joinpath(rt, found), joinpath(rt, "v$ver"))
+    end
+
+    # Same scratch filesystem: this is a cheap rename.
+    mv(rt, dest)
+    _write_marker(dest, release, upd; source = "container")
+    rm(rootfs; recursive = true, force = true)
+    keep_installer || rm(idir; recursive = true, force = true)
+    @info "MATLAB Runtime $(release) (update $(upd)) installed at $(dest)" tag
+    return dest
+end
+
+
 """Directory names of the installed runtime versions (`v<ver>`) under `root`."""
 function _version_dirs(root)
     isdir(root) || return String[]
@@ -112,11 +314,12 @@ function _marker_field(dest, key)
     error("Marker file for $(dest) has no field $(key)")
 end
 
-function _write_marker(dest, release, update)
+function _write_marker(dest, release, update; source = "installer")
     open(joinpath(dest, MARKER), "w") do io
         println(io, "release=", release)
         println(io, "update=", update)
         println(io, "platform=", _platform())
+        println(io, "source=", source)
     end
 end
 
@@ -192,6 +395,29 @@ function _find_installer(dir)
     error("No installer executable found in $(dir)")
 end
 
+"""
+    _extraction_complete(dir) -> Bool
+
+Whether `dir` contains a complete extracted installer: the entry-point
+script/executable plus the per-architecture installer binary for the
+current platform. Used to decide whether a previous extraction can be
+reused instead of re-extracting the multi-GB archive.
+"""
+function _extraction_complete(dir)
+    isdir(dir) || return false
+    try
+        _find_installer(dir)
+    catch
+        return false
+    end
+    Sys.iswindows() && return true
+    archbin = joinpath(dir, "bin", _platform())
+    isdir(archbin) || return false
+    return any(isfile(joinpath(archbin, f)) for f in
+               ("MathWorksProductInstaller", "MATLABRuntimeInstaller",
+                "install_unix", "install_unix_legacy"))
+end
+
 """Whether the current process has administrator privileges (Windows only)."""
 _is_elevated() =
     Sys.iswindows() ? ccall((:IsUserAnAdmin, :shell32), stdcall, Cint, ()) != 0 : true
@@ -240,29 +466,67 @@ end
 
 """
     install(; release = _release(), update = _update(), force = false,
-             keep_installer = false) -> String
+             keep_installer = false, backend = _setting("BACKEND", "auto"),
+             variant = _setting("VARIANT", "")) -> String
 
-Download the MATLAB Runtime installer for `(release, update)` from MathWorks
-and run it silently, installing into the package scratch space
-(`<depot>/scratchspaces/<uuid>/matlabruntime/runtime/<release>_<update>`).
+Install the MATLAB Runtime for `(release, update)` into the package scratch
+space (`<depot>/scratchspaces/<uuid>/matlabruntime/runtime/<release>_<update>`)
+and return the installation root (the directory that contains the `v<ver>`
+runtime folder).
 
-Returns the installation root (the directory that contains the `v<ver>`
-runtime folder). Reuses an existing installation unless `force = true`.
-The downloaded zip and extracted installer are deleted afterwards unless
-`keep_installer = true`.
+Backends (`MATLABRUNTIME_JLL_BACKEND` / the `backend` preference):
+
+- `"container"` (default on Linux): pull the official MathWorks container
+  image `containers.mathworks.com/matlab-runtime` and unpack the
+  already-installed runtime. Pure HTTP + `tar`; no Docker/Singularity, no
+  admin rights, and the MathWorks installer is never executed.
+  `variant = "full"` selects the image variant that includes GPU libraries.
+- `"installer"` (default on Windows, fallback on Linux): download the
+  installer zip from MathWorks and run it silently.
+
+`auto` picks `container` on Linux and `installer` on Windows, and falls back
+to the installer if the container pull fails. On Windows the installer
+manifest requires administrator privileges; if Julia is not running elevated
+a single UAC consent prompt is shown.
 
 Installing takes several GB of disk space and several minutes.
 """
 function install(; release = _release(), update = _update(), force = false,
-                 keep_installer = false)
+                 keep_installer = false, backend = _setting("BACKEND", "auto"),
+                 variant = _setting("VARIANT", ""))
     release = string(release)
     upd = string(update)
-    platform = _platform()
+    _platform()  # validate the platform up front
     dest = _runtime_dir(release, upd)
     if !force && is_installed(release, upd)
         @info "MATLAB Runtime $(release) (update $(upd)) is already installed at $(dest)"
         return dest
     end
+
+    b = lowercase(string(backend))
+    if b in ("", "auto", "container") && !Sys.iswindows()
+        try
+            return _install_from_container(release, upd; variant, force, keep_installer)
+        catch err
+            b == "container" && rethrow()
+            @warn "Container install failed; falling back to the MathWorks installer" exception = (err, catch_backtrace())
+        end
+    elseif b == "container" && Sys.iswindows()
+        error("The container backend is not available on Windows; use backend \"installer\".")
+    end
+    return _install_from_installer(release, upd; force, keep_installer)
+end
+
+"""
+    _install_from_installer(release, upd; force, keep_installer) -> String
+
+Install the runtime the classic way: download the MATLAB Runtime installer
+zip from MathWorks and run it silently. See [`install`](@ref) for the
+public entry point.
+"""
+function _install_from_installer(release, upd; force = false, keep_installer = false)
+    platform = _platform()
+    dest = _runtime_dir(release, upd)
 
     url = download_url(; release, update = upd)
     @info "Downloading MATLAB Runtime $(release) (update $(upd), $(platform))" *
@@ -274,9 +538,13 @@ function install(; release = _release(), update = _update(), force = false,
     _ensure_downloaded(url, zip)
 
     exdir = joinpath(idir, "extracted_$(release)_$(upd)_$(platform)")
-    rm(exdir; recursive = true, force = true)
-    @info "Extracting installer archive"
-    _extract(zip, exdir)
+    if !force && _extraction_complete(exdir)
+        @info "Reusing previously extracted installer" exdir
+    else
+        rm(exdir; recursive = true, force = true)
+        @info "Extracting installer archive"
+        _extract(zip, exdir)
+    end
     if !Sys.iswindows()
         # The installer zip does not preserve executable bits; the installer
         # dies with exit code 42 when its helper binaries (e.g. silentlauncher)
@@ -417,14 +685,17 @@ Environment variables required to execute binaries compiled with MATLAB
 Compiler against the runtime at `root`:
 
 - Windows: `PATH` including `runtime`, `bin` and `sys/os` library dirs,
-- Linux: `LD_LIBRARY_PATH` with the same directories.
+- Linux: `LD_LIBRARY_PATH` with the same directories (plus `sys/opengl/lib`
+  and `extern/bin` when present).
 
 Use [`with_runtime`](@ref) to apply these to a command.
 """
 function mcr_env(root = mcr_root())
     verdir = joinpath(root, "v" * mcr_version(root))
     arch = _platform()
-    dirs = [joinpath(verdir, d, arch) for d in ("runtime", "bin", "sys/os")]
+    subdirs = Sys.iswindows() ? ("runtime", "bin", "sys/os") :
+              ("runtime", "bin", "sys/os", "sys/opengl/lib", "extern/bin")
+    dirs = [joinpath(verdir, d, arch) for d in subdirs]
     filter!(isdir, dirs)
     isempty(dirs) && error("No runtime library directories found under $(verdir)")
     joined = join(dirs, _PATHSEP)

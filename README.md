@@ -1,12 +1,27 @@
 # MatlabRuntime_jll
 
-A Julia `_jll`-style package that downloads and silently installs the
+A Julia `_jll`-style package that installs the
 [MATLAB Runtime](https://www.mathworks.com/products/compiler/matlab-runtime.html)
-so that other packages can execute binaries compiled with MATLAB Compiler,
-without requiring a MATLAB installation.
+into the package scratch space so that other packages can execute binaries
+compiled with MATLAB Compiler, without requiring a MATLAB installation.
 
 Supported platforms: **Windows x64** (`win64`) and **Linux x64** (`glnxa64`).
 macOS is intentionally not supported.
+
+## How it installs
+
+Two backends; the choice is automatic and overridable:
+
+- **`container` (default on Linux):** pulls the official MathWorks container
+  image (`containers.mathworks.com/matlab-runtime`) directly over the OCI
+  registry HTTP API and unpacks the already-installed runtime tree from
+  `/opt/matlabruntime`. Pure Julia (HTTP + `tar`) — no Docker/Singularity,
+  no admin rights, and the MathWorks installer is never executed. This is
+  the most portable path: it works the same on any x86_64 Linux machine
+  that can reach the registry, including clusters where the silent installer
+  is fragile (NFS homes, unsupported distros, containers, minimal images).
+- **`installer` (default on Windows, fallback on Linux):** downloads the
+  MATLAB Runtime installer zip from MathWorks and runs it silently.
 
 > **Note (Windows):** MathWorks' runtime installer (`setup.exe`) requires
 > administrator privileges (`requireAdministrator` manifest). If Julia is
@@ -48,7 +63,8 @@ update = "0"
 
 or users can set the environment variables `MATLABRUNTIME_JLL_RELEASE` /
 `MATLABRUNTIME_JLL_UPDATE`. `update = "0"` is the base release; `"1"`, `"2"`,
-... select update releases (the installer URL and file name change accordingly).
+... select update releases (the installer URL and container image tag change
+accordingly).
 
 ### Environment variables
 
@@ -56,6 +72,8 @@ or users can set the environment variables `MATLABRUNTIME_JLL_RELEASE` /
 | --- | --- |
 | `MATLABRUNTIME_JLL_ROOT` | Use this existing runtime root (directory containing `v<ver>` folders); skips all downloads. |
 | `MATLABRUNTIME_JLL_RELEASE` / `MATLABRUNTIME_JLL_UPDATE` | Override the requested release/update. |
+| `MATLABRUNTIME_JLL_BACKEND` | `"auto"` (default; container on Linux, installer on Windows), `"container"`, or `"installer"`. |
+| `MATLABRUNTIME_JLL_VARIANT` | Container image variant: `""` (default) or `"full"` (includes GPU libraries). |
 | `MATLABRUNTIME_JLL_NO_AUTO_INSTALL` | Set to `true` to disable automatic download+install from `mcr_root()`. |
 
 ### Where the runtime is installed
@@ -70,11 +88,13 @@ versions can coexist. `MatlabRuntime_jll.uninstall()` removes one.
 
 | Function | Description |
 | --- | --- |
-| `install(; release, update, force, keep_installer)` | Download + silent install; returns the runtime root. |
+| `install(; release, update, force, keep_installer, backend, variant)` | Install; returns the runtime root. |
 | `uninstall(; release, update)` | Remove a scratch-space installation. |
 | `is_installed([release, [update]])` | Whether the runtime is installed. |
 | `installed_releases()` | List installed `(release, update)` pairs. |
-| `download_url(; release, update)` | Direct MathWorks download URL for the installer zip. |
+| `download_url(; release, update)` | Direct MathWorks download URL for the installer zip (installer backend). |
+| `container_tag(; release, update, variant)` | Tag of the official MATLAB Runtime container image (container backend). |
+| `release_version([release])` | Runtime version string for a release, e.g. `"R2026b"` -> `"26.2"`. |
 | `mcr_root()` | Installation root (contains `v<ver>`). Pass to `run_*.sh`/`run_*.bat` launchers. |
 | `mcr_version([root])` | Runtime version string, e.g. `"26.2"`. |
 | `runtime_lib_dir([root])` | Directory with the runtime shared libraries. |
@@ -84,25 +104,26 @@ versions can coexist. `MatlabRuntime_jll.uninstall()` removes one.
 
 ## License note
 
-Downloading the MATLAB Runtime implies acceptance of the MathWorks license.
-The runtime itself is proprietary; this package only automates its
-download and installation.
+Downloading the MATLAB Runtime (installer or container image) implies
+acceptance of the MathWorks license. The runtime itself is proprietary;
+this package only automates its download and installation.
 
 ## Troubleshooting
 
-**Linux: installer exits with code 42, no output.**
-This means the installer could not load required OS libraries. On
-minimal/headless systems (WSL, containers, cluster nodes) install the usual
-set before running `install()`:
+**Linux: the silent installer exits with code 42, no output.**
+This is the MathWorks installer failing during its own startup — commonly
+on unsupported distros, NFS home directories, or minimal/headless images.
+The container backend avoids the installer entirely and is the default on
+Linux; if you explicitly selected `MATLABRUNTIME_JLL_BACKEND=installer` and
+see exit 42, install the usual OS libraries first and retry:
 
 ```bash
 apt-get install libnss3 libnspr4 libxi6 libxtst6 libxext6 libx11-6 libxcb1
 ```
 
-The package automatically marks all extracted installer files as executable
-(the MathWorks zip does not preserve the executable bit; without this the
-installer dies with exit code 42 while spawning `silentlauncher`). The
-installer log is written to `/tmp/mathworks_<user>.log`.
+The package also marks all extracted installer files as executable (the
+MathWorks zip does not preserve the executable bit). The installer log is
+written to `/tmp/mathworks_<user>.log`.
 
 **Linux: `install` runs coreutils instead of the MathWorks script.**
 The package invokes the installer by absolute path, so this cannot happen
@@ -113,7 +134,8 @@ through this package's API; if you run it manually, use `./install`.
 PowerShell when Julia is not running elevated.
 
 **Re-running a failed install.**
-A fully downloaded installer zip is reused (verified against the server's
-`Content-Length`); extraction always starts fresh. Use
-`install(; keep_installer = true)` to keep the zip and extracted installer
-for debugging.
+Fully downloaded archives are reused: the installer zip is verified against
+the server's `Content-Length`, and container layers are verified against the
+sizes recorded in the image manifest. Use
+`install(; keep_installer = true)` to keep the downloaded zip / container
+layers for debugging.

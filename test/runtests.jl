@@ -60,11 +60,48 @@ const MCR = MatlabRuntime_jll
         end
     end
 
+    @testset "release/version mapping" begin
+        @test MCR.release_version("R2026b") == "26.2"
+        @test MCR.release_version("R2025a") == "25.1"
+        @test MCR.release_version("R2020a") == "20.1"
+        @test_throws ErrorException MCR.release_version("2026b")
+        @test_throws ErrorException MCR.release_version("R2026c")
+    end
+
+    @testset "container_tag" begin
+        @test MCR.container_tag() == "r2026b"
+        @test MCR.container_tag(; release = "R2020a", update = "5") == "r2020a-update-5"
+        @test MCR.container_tag(; release = "R2020a", update = 5, variant = "full") == "r2020a-update-5-full"
+        @test MCR.container_tag(; update = "0", variant = "full") == "r2026b-full"
+    end
+
+    @testset "container registry" begin
+        if Sys.islinux() && Sys.ARCH === :x86_64
+            token = nothing
+            try
+                token = MCR._container_token()
+            catch
+            end
+            if token !== nothing
+                @test length(token) > 100
+                m = MCR._container_manifest(MCR.container_tag(), token)
+                @test haskey(m, "layers")
+                @test !isempty(m["layers"])
+                @test all(haskey(l, "digest") for l in m["layers"])
+            else
+                @warn "Skipping container registry test (registry unreachable)"
+            end
+        end
+    end
+
     @testset "marker logic" begin
         mktempdir() do dest
             MCR._write_marker(dest, "R2999a", "0")
             @test MCR._marker_field(dest, "release") == "R2999a"
             @test MCR._marker_field(dest, "platform") == MCR._platform()
+            @test MCR._marker_field(dest, "source") == "installer"
+            MCR._write_marker(dest, "R2999a", "1"; source = "container")
+            @test MCR._marker_field(dest, "source") == "container"
         end
     end
 
