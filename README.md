@@ -87,3 +87,33 @@ versions can coexist. `MatlabRuntime_jll.uninstall()` removes one.
 Downloading the MATLAB Runtime implies acceptance of the MathWorks license.
 The runtime itself is proprietary; this package only automates its
 download and installation.
+
+## Troubleshooting
+
+**Linux: installer exits with code 42, no output.**
+This means the installer could not load required OS libraries. On
+minimal/headless systems (WSL, containers, cluster nodes) install the usual
+set before running `install()`:
+
+```bash
+apt-get install libnss3 libnspr4 libxi6 libxtst6 libxext6 libx11-6 libxcb1
+```
+
+The package automatically marks all extracted installer files as executable
+(the MathWorks zip does not preserve the executable bit; without this the
+installer dies with exit code 42 while spawning `silentlauncher`). The
+installer log is written to `/tmp/mathworks_<user>.log`.
+
+**Linux: `install` runs coreutils instead of the MathWorks script.**
+The package invokes the installer by absolute path, so this cannot happen
+through this package's API; if you run it manually, use `./install`.
+
+**Windows: "Permission denied" spawning the installer.**
+`setup.exe` requires elevation; the package shows a UAC prompt via
+PowerShell when Julia is not running elevated.
+
+**Re-running a failed install.**
+A fully downloaded installer zip is reused (verified against the server's
+`Content-Length`); extraction always starts fresh. Use
+`install(; keep_installer = true)` to keep the zip and extracted installer
+for debugging.

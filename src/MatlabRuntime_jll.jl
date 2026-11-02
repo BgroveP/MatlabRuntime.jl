@@ -228,8 +228,12 @@ function _run_installer(installer, dest)
         end
         return
     end
+    # Invoke by absolute path: a bare `install` would resolve to
+    # coreutils /usr/bin/install on Linux instead of the MathWorks script.
+    # The cd matters because the installer expects to find its payload
+    # relative to its own directory.
     cd(dirname(installer)) do
-        run(`$(basename(installer)) $(flags)`)
+        run(`$(abspath(installer)) $(flags)`)
     end
     return
 end
@@ -273,6 +277,13 @@ function install(; release = _release(), update = _update(), force = false,
     rm(exdir; recursive = true, force = true)
     @info "Extracting installer archive"
     _extract(zip, exdir)
+    if !Sys.iswindows()
+        # The installer zip does not preserve executable bits; the installer
+        # dies with exit code 42 when its helper binaries (e.g. silentlauncher)
+        # cannot be executed. Mark all extracted files as executable.
+        find = Sys.which("find")
+        find === nothing || run(`$find $exdir -type f -exec chmod a+x "{}" +`)
+    end
 
     installer = _find_installer(exdir)
     chmod(installer, 0o755)
@@ -283,6 +294,11 @@ function install(; release = _release(), update = _update(), force = false,
 
     isempty(_version_dirs(dest)) &&
         error("MATLAB Runtime installer finished but no v<version> directory was created in $(dest). " *
+              (Sys.islinux() ?
+                "If the installer exited with code 42, required OS libraries are missing " *
+                "(on a minimal/headless system install e.g. " *
+                "`apt-get install libnss3 libnspr4 libxi6 libxtst6 libxext6 libx11-6 libxcb1`). " * string("The installer log is in /tmp/mathworks_\$(get(ENV, \"USER\", \"user\")).log. ") :
+                "") *
               "The installer may have failed; check its output above.")
     _write_marker(dest, release, upd)
 
