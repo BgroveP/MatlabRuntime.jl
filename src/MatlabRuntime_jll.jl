@@ -120,12 +120,51 @@ function _write_marker(dest, release, update)
     end
 end
 
+"""
+    _ensure_downloaded(url, zip)
+
+Download `url` to `zip`, reusing an existing archive if its size matches the
+`Content-Length` of the remote file (protects against re-downloading a
+multi-GB installer after a failed/interrupted previous run).
+"""
+function _ensure_downloaded(url, zip)
+    if isfile(zip)
+        reusable = false
+        expected = nothing
+        try
+            resp = Downloads.request(url; method = "HEAD")
+            headers = Dict(lowercase(k) => v for (k, v) in resp.headers)
+            expected = tryparse(Int, get(headers, "content-length", ""))
+            reusable = resp.status == 200 && expected !== nothing &&
+                       filesize(zip) == expected
+        catch
+            reusable = false
+        end
+        if reusable
+            @info "Reusing previously downloaded installer archive" zip
+            return zip
+        end
+        @info "Existing archive is incomplete or stale; downloading again" zip
+    end
+    Downloads.download(url, zip)
+    return zip
+end
+
 function _extract(zip, dest)
     mkpath(dest)
     if Sys.iswindows()
-        tar = Sys.which("tar")
-        tar === nothing && error("tar.exe not found on PATH (requires Windows 10 1803+).")
-        run(`$tar -xf $zip -C $dest`)
+        # Use the Windows built-in bsdtar (System32\tar.exe). Do NOT use
+        # Sys.which("tar"): on machines with Git Bash on PATH that resolves to
+        # GNU tar, which cannot read zip files and chokes on C:\ paths.
+        tar = joinpath(get(ENV, "SystemRoot", "C:\\Windows"), "System32", "tar.exe")
+        if isfile(tar)
+            run(`$tar -xf $zip -C $dest`)
+        else
+            shell = something(Sys.which("pwsh"), Sys.which("powershell"))
+            shell === nothing && error(
+                "Extraction requires Windows 10 1803+ (tar.exe) or PowerShell.")
+            run(`$shell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '$zip' -DestinationPath '$dest'"`)
+        end
     else
         unzip = Sys.which("unzip")
         bsdtar = Sys.which("bsdtar")
@@ -151,6 +190,48 @@ function _find_installer(dir)
         end
     end
     error("No installer executable found in $(dir)")
+end
+
+"""Whether the current process has administrator privileges (Windows only)."""
+_is_elevated() =
+    Sys.iswindows() ? ccall((:IsUserAnAdmin, :shell32), stdcall, Cint, ()) != 0 : true
+
+"""
+    _run_installer(installer, dest) -> Nothing
+
+Run the extracted MATLAB Runtime installer silently, installing into `dest`.
+
+On Windows the installer manifest requires administrator privileges
+(`requireAdministrator`). If the current process is not elevated, the
+installer is launched through PowerShell `Start-Process -Verb RunAs`, which
+shows a single UAC consent prompt; the installation itself is silent.
+"""
+function _run_installer(installer, dest)
+    flags = `-mode silent -agreeToLicense yes -destinationFolder $(dest)`
+    if Sys.iswindows() && !_is_elevated()
+        @info "MATLAB Runtime installer requires administrator privileges on Windows." *
+              " A UAC consent dialog will appear; please approve it." installer
+        shell = something(Sys.which("pwsh"), Sys.which("powershell"))
+        shell === nothing && error("PowerShell is required to elevate the MATLAB Runtime installer.")
+        ps1 = tempname() * ".ps1"
+        open(ps1, "w") do io
+            println(io, "\$ErrorActionPreference = 'Stop'")
+            println(io, "\$p = Start-Process -FilePath '$installer' " *
+                        "-ArgumentList '-mode','silent','-agreeToLicense','yes'," *
+                        "'-destinationFolder','\"$dest\"' -Verb RunAs -Wait -PassThru")
+            println(io, "exit \$p.ExitCode")
+        end
+        try
+            run(`$shell -NoProfile -ExecutionPolicy Bypass -File $(ps1)`)
+        finally
+            rm(ps1; force = true)
+        end
+        return
+    end
+    cd(dirname(installer)) do
+        run(`$(basename(installer)) $(flags)`)
+    end
+    return
 end
 
 """
@@ -186,7 +267,7 @@ function install(; release = _release(), update = _update(), force = false,
     idir = _installer_dir()
     mkpath(idir)
     zip = joinpath(idir, "MATLAB_Runtime_$(release)_$(upd)_$(platform).zip")
-    Downloads.download(url, zip)
+    _ensure_downloaded(url, zip)
 
     exdir = joinpath(idir, "extracted_$(release)_$(upd)_$(platform)")
     rm(exdir; recursive = true, force = true)
@@ -198,7 +279,7 @@ function install(; release = _release(), update = _update(), force = false,
 
     mkpath(dirname(dest))
     @info "Running MATLAB Runtime installer silently; this can take several minutes" dest
-    run(setcwd(`$(installer) -mode silent -agreeToLicense yes -destinationFolder $(dest)`, dirname(installer)))
+    _run_installer(installer, dest)
 
     isempty(_version_dirs(dest)) &&
         error("MATLAB Runtime installer finished but no v<version> directory was created in $(dest). " *

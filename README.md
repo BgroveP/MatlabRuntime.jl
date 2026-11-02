@@ -8,6 +8,13 @@ without requiring a MATLAB installation.
 Supported platforms: **Windows x64** (`win64`) and **Linux x64** (`glnxa64`).
 macOS is intentionally not supported.
 
+> **Note (Windows):** MathWorks' runtime installer (`setup.exe`) requires
+> administrator privileges (`requireAdministrator` manifest). If Julia is
+> not running elevated, `install()` triggers a single UAC consent prompt via
+> PowerShell `Start-Process -Verb RunAs`; the installation itself is silent.
+> If you decline the prompt, installation is aborted. Linux needs no
+> elevation because the runtime installs into a user-writable directory.
+
 ## Usage
 
 ```julia
