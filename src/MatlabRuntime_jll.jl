@@ -497,6 +497,33 @@ function _run_installer(installer, dest)
     return
 end
 
+"""Sort key for release ordering: R2017a -> 4034, R2017b -> 4035, ..."""
+function _release_index(release)
+    m = match(r"^R(\d{4})([ab])$", string(release))
+    m === nothing && error("Invalid MATLAB release name \"$(release)\" " *
+                           "(expected e.g. \"R2026b\")")
+    return parse(Int, m.captures[1]) * 2 + (m.captures[2] == "b")
+end
+
+# MathWorks distribution boundaries, determined empirically: the installer
+# download URLs serve R2019a and newer, the container registry has images
+# from R2021b onward. Older releases are gone; a matching runtime tree must
+# come from an existing installation (find_system_runtime / env override).
+const _INSTALLER_MIN = _release_index("R2019a")
+const _CONTAINER_MIN = _release_index("R2021b")
+
+"""Error thrown when MathWorks no longer distributes the requested release."""
+function _undistributed_error(release)
+    return ErrorException(
+        "MATLAB Runtime $(release) is not distributed by MathWorks anymore: " *
+        "installer downloads are available from R2019a onward and container images " *
+        "from R2021b onward, and MATLAB-compiled binaries require the exact runtime " *
+        "version they were built with. Point the package at an existing installation " *
+        "instead: set $(ENV_ROOT) (or MCR_ROOT) to a runtime root containing " *
+        "$(version_dir(release)), or use find_system_runtime(; release = \"$(release)\") " *
+        "to locate a system-wide installation.")
+end
+
 """
     install(; release = _release(), update = _update(), force = false,
              keep_installer = false, backend = _setting("BACKEND", "auto"),
@@ -522,6 +549,11 @@ to the installer if the container pull fails. On Windows the installer
 manifest requires administrator privileges; if Julia is not running elevated
 a single UAC consent prompt is shown.
 
+Releases that MathWorks no longer distributes (installer downloads start at
+R2019a, container images at R2021b) fail immediately with an error explaining
+how to use an existing runtime tree via `MATLABRUNTIME_JLL_ROOT` or
+`find_system_runtime`.
+
 Installing takes several GB of disk space and several minutes.
 """
 function install(; release = _release(), update = _update(), force = false,
@@ -537,15 +569,28 @@ function install(; release = _release(), update = _update(), force = false,
     end
 
     b = lowercase(string(backend))
-    if b in ("", "auto", "container") && !Sys.iswindows()
+    idx = _release_index(release)
+    container_possible = !Sys.iswindows() && idx >= _CONTAINER_MIN
+    installer_possible = idx >= _INSTALLER_MIN
+
+    if !container_possible && !installer_possible
+        throw(_undistributed_error(release))
+    end
+    if b == "container" && !container_possible
+        Sys.iswindows() &&
+            error("The container backend is not available on Windows; use backend \"installer\".")
+        installer_possible || throw(_undistributed_error(release))
+        error("No container image exists for $(release) (images start at R2021b); " *
+              "use backend \"installer\".")
+    end
+
+    if b in ("", "auto", "container") && container_possible
         try
             return _install_from_container(release, upd; variant, force, keep_installer)
         catch err
             b == "container" && rethrow()
             @warn "Container install failed; falling back to the MathWorks installer" exception = (err, catch_backtrace())
         end
-    elseif b == "container" && Sys.iswindows()
-        error("The container backend is not available on Windows; use backend \"installer\".")
     end
     return _install_from_installer(release, upd; force, keep_installer)
 end

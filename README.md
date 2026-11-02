@@ -69,9 +69,10 @@ accordingly).
 **Old releases (important for pre-2019 binaries).** Deployed binaries only
 run against the exact runtime version they were compiled with. MathWorks
 currently serves installer downloads only for R2019a and newer, and the
-container registry only has R2021b and newer — so for older applications
-(e.g. anything needing the R2017a / v9.2 runtime), `install()` cannot fetch
-the runtime. In that case point the package at an existing installation:
+container registry only has R2021b and newer. `install()` fails immediately
+with a clear error for undistributed releases, so for older applications
+(e.g. anything needing the R2017a / v9.2 runtime) point the package at an
+existing installation:
 
 - `find_system_runtime(release = "R2017a")` checks the default system
   locations (`/usr/local/MATLAB/MATLAB_Runtime`, `/opt/...`) and the

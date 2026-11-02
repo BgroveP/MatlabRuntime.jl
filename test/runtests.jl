@@ -134,6 +134,30 @@ const MCR = MatlabRuntime_jll
         end
     end
 
+    @testset "release availability guard" begin
+        # R2017a is not distributed by MathWorks anymore: fail fast, no network
+        err = try
+            MCR.install(; release = "R2017a")
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("not distributed", err.msg)
+        @test occursin(MCR.version_dir("R2017a"), err.msg)  # mentions v92
+        # explicit container backend for a pre-R2021b release also fails fast
+        if Sys.islinux()
+            err2 = try
+                MCR.install(; release = "R2020a", backend = "container")
+                nothing
+            catch e
+                e
+            end
+            @test err2 isa ErrorException
+            @test occursin("No container image exists", err2.msg)
+        end
+    end
+
     @testset "system runtime detection" begin
         # The explicit root hint always wins
         withenv("MATLABRUNTIME_JLL_ROOT" => "some_fake_dir") do
