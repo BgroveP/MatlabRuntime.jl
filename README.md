@@ -134,12 +134,24 @@ this package only automates its download and installation.
 
 ## Troubleshooting
 
+**Linux: installer fails or hangs on a cluster (NFS home).**
+The MathWorks installer can misbehave when its payload is on NFS. The
+package therefore extracts the installer to `$TMPDIR` (usually node-local
+on HPC systems); only the downloaded archive is kept in the shared scratch
+space so it is reused across nodes. Override the extraction location with
+`MATLABRUNTIME_JLL_EXTRACT_DIR` (or the `EXTRACT_DIR` preference). This
+matters for releases without a container image (R2021a and earlier, e.g.
+R2017a), which always use the installer. If the *installation destination*
+itself fails on NFS, install the runtime manually into node-local storage
+and point `MATLABRUNTIME_JLL_ROOT` at it.
+
 **Linux: the silent installer exits with code 42, no output.**
 This is the MathWorks installer failing during its own startup — commonly
 on unsupported distros, NFS home directories, or minimal/headless images.
 The container backend avoids the installer entirely and is the default on
-Linux; if you explicitly selected `MATLABRUNTIME_JLL_BACKEND=installer` and
-see exit 42, install the usual OS libraries first and retry:
+Linux for R2021b and later; for older releases, or if you explicitly
+selected `MATLABRUNTIME_JLL_BACKEND=installer`, install the usual OS
+libraries first and retry:
 
 ```bash
 apt-get install libnss3 libnspr4 libxi6 libxtst6 libxext6 libx11-6 libxcb1

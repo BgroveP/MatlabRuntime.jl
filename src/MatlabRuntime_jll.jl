@@ -649,18 +649,24 @@ function _install_from_installer(release, upd; force = false, keep_installer = f
     archive = joinpath(idir, basename(url))
     _ensure_downloaded(url, archive)
 
+    # Extract to node-local storage: on clusters $TMPDIR is usually a
+    # node-local disk, while the package scratch space may be on NFS, which
+    # the MathWorks installer does not always tolerate. The downloaded
+    # archive stays in the shared scratch space for reuse across nodes.
+    exbase = _setting("EXTRACT_DIR", tempdir())
+    exdir = joinpath(exbase, "matlabruntime_jll_extract_$(release)_$(upd)_$(platform)")
+
     mkpath(dirname(dest))
     installer = if Sys.iswindows() && endswith(lowercase(basename(url)), ".exe")
         # Legacy MCR installer (R2018a and earlier): a self-extracting exe
         # that IS the installer; run it directly, no extraction step.
         archive
     else
-        exdir = joinpath(idir, "extracted_$(release)_$(upd)_$(platform)")
         if !force && _extraction_complete(exdir)
             @info "Reusing previously extracted installer" exdir
         else
             rm(exdir; recursive = true, force = true)
-            @info "Extracting installer archive"
+            @info "Extracting installer archive" exdir
             _extract(archive, exdir)
         end
         if !Sys.iswindows()
@@ -689,7 +695,6 @@ function _install_from_installer(release, upd; force = false, keep_installer = f
 
     if !keep_installer
         rm(archive; force = true)
-        exdir = joinpath(idir, "extracted_$(release)_$(upd)_$(platform)")
         rm(exdir; recursive = true, force = true)
     end
     @info "MATLAB Runtime $(release) (update $(upd)) installed at $(dest)"
